@@ -15,6 +15,16 @@ Easy tasks → <EASY_MODEL> (free tier)
 Hard tasks → <HARD_CODING_MODEL> / <HARD_PLANNING_MODEL> (paid, but only when genuinely needed)
 
 Logs every routing decision to <LOG_PATH>.
+
+2026-08-10 (gap fix):
+  - _recent_text window widened 2→4 messages (user directive often sits one
+    hop before a trailing tool result and was being dropped → default/easy).
+  - Tool-based phase detection no longer counts orchestration tooling
+    (Agent/Workflow/TaskCreate/TaskUpdate) — those are always loaded in agent
+    contexts, so they flooded routes into orchestration.
+  - New structural hard signal: tools>=N AND ctx>50k (a real working session)
+    counts toward escalation even when the last user-visible text is a terse
+    directive or a bare tool result.
 """
 
 import re
@@ -83,13 +93,16 @@ _SKIP_MODELS = {
 # Fallback chain — when primary fails (timeout, malformed tool call, or
 # downstream HTTP 5xx), litellm's cooldown layer consults this.
 # Format: primary_model -> [fallback1, fallback2, fallback3]
+# Easy-task ladders lead with the NEXT-BEST model (not paid). A hard-task
+# primary degrades to another paid model first (paid→paid), never silently
+# to the free tier.
 FALLBACKS: Dict[str, List[str]] = {
-    "<HARD_CODING_MODEL>":    ["<EASY_MODEL>",          "<FALLBACK_MODEL_D>",     "<FALLBACK_MODEL_B>"],
-    "<ORCHESTRATION_MODEL>":         ["<EASY_MODEL>",          "<FALLBACK_MODEL_D>",     "<FALLBACK_MODEL_B>"],
-    "<EASY_MODEL>":              ["<EASY_MODEL_FALLBACK>",              "<FALLBACK_MODEL_D>",     "<HARD_CODING_MODEL>"],
-    "<EASY_MODEL_FALLBACK>":                  ["<FALLBACK_MODEL_D>",      "<ORCHESTRATION_MODEL>",   "<HARD_CODING_MODEL>"],
-    "<HARD_PLANNING_MODEL>":     ["<HARD_PLANNING_FALLBACK>",       "<EASY_MODEL>",        "<HARD_CODING_MODEL>"],
-    "<HARD_PLANNING_FALLBACK>":           ["<HARD_PLANNING_MODEL>", "<EASY_MODEL>",        "<HARD_CODING_MODEL>"],
+    "<HARD_CODING_MODEL>":    ["<HARD_PLANNING_MODEL>", "<HARD_PLANNING_FALLBACK>", "<EASY_MODEL>"],
+    "<ORCHESTRATION_MODEL>":  ["<EASY_MODEL>",          "<EASY_MODEL_FALLBACK>",   "<FALLBACK_MODEL_D>"],
+    "<EASY_MODEL>":           ["<EASY_MODEL_FALLBACK>", "<FALLBACK_MODEL_D>",      "<FALLBACK_MODEL_B>"],
+    "<EASY_MODEL_FALLBACK>":  ["<FALLBACK_MODEL_D>",    "<FALLBACK_MODEL_B>",      "<FALLBACK_MODEL_C>"],
+    "<HARD_PLANNING_MODEL>":  ["<HARD_PLANNING_FALLBACK>", "<HARD_CODING_MODEL>",  "<EASY_MODEL>"],
+    "<HARD_PLANNING_FALLBACK>": ["<HARD_CODING_MODEL>", "<HARD_PLANNING_MODEL>",   "<EASY_MODEL>"],
 }
 
 # Models that are "default" from Claude Code — safe to rewrite.
@@ -283,12 +296,13 @@ _EASY_KW = re.compile(
     re.IGNORECASE,
 )
 
-# Tool name patterns → phase hints
+# Tool name patterns → phase hints.
+# Orchestration tooling (Agent/Workflow/TaskCreate/TaskUpdate) is deliberately
+# absent: in agent contexts these tools are loaded in EVERY session regardless
+# of the user's intent, so counting them as orchestration votes floods the
+# classifier into orchestration even on 2-message requests whose only signal
+# is the tool inventory. Tool-based detection must never trump user words.
 _TOOL_PHASE = {
-    "Agent":        "orchestration",
-    "Workflow":     "orchestration",
-    "TaskCreate":   "orchestration",
-    "TaskUpdate":   "orchestration",
     "Edit":         "coding",
     "Write":        "coding",
     "NotebookEdit": "coding",
@@ -308,6 +322,12 @@ _LONG_CTX_THRESHOLD = 180_000
 _HARD_KW_MIN = 1          # need at least this many hard keyword hits (amplified: was 2)
 _HARD_PROMPT_LEN = 1000   # prompts longer than this (chars) add a hard signal
 _HARD_CTX_TOKENS = 50_000 # context > this many tokens adds a hard signal
+# Tools present with a large context = a real working session, not a bare
+# completion. Agent contexts always load a tool inventory, so tools>0 +
+# ctx>50k is a strong structural hard signal that the continuation is
+# substantive work, even when the last user-visible text is a terse directive
+# or a bare tool result.
+_TOOLS_HARD = 50
 _HARD_SIGNALS_MIN = 1     # ANY single hard signal can escalate (was 2 — the
                           # 50k-ctx signal alone was the dominant blocker: 236/300
                           # classifications sat at exactly 1 signal and stayed on <EASY_MODEL>).
@@ -439,8 +459,9 @@ class PhaseRouter(CustomLogger):
           coding, coding_hard, orchestration, lookup, long_context, default
         """
 
-        text = self._recent_text(messages, last_n=2)
+        text = self._recent_text(messages, last_n=4)
         est_tokens = self._estimate_tokens(messages)
+        tool_count = len(tools)
 
         # --- Phase classification (keyword-based, user intent first) ---
 
@@ -548,6 +569,8 @@ class PhaseRouter(CustomLogger):
                 hard_signals += 1
             if est_tokens > _HARD_CTX_TOKENS:
                 hard_signals += 1
+            if tool_count >= _TOOLS_HARD and est_tokens > _HARD_CTX_TOKENS:
+                hard_signals += 1
 
             # User-message intent (the part that's under the operator's control):
             # a hard keyword, a quality-qualifier, or a terse directive.
@@ -557,7 +580,8 @@ class PhaseRouter(CustomLogger):
             # the user's own message is an easy reply ("ok", "yes", "what is X").
             ctx_only = (hard_signals == 1 and est_tokens > _HARD_CTX_TOKENS
                         and hard_score == 0 and directive_score == 0
-                        and len(text) <= _HARD_PROMPT_LEN)
+                        and len(text) <= _HARD_PROMPT_LEN
+                        and tool_count < _TOOLS_HARD)
             easy_reply = (easy_score >= 1 and not user_intent)
 
             # Escalate if: enough hard keyword hits AND more hard than easy
@@ -589,7 +613,7 @@ class PhaseRouter(CustomLogger):
                 "classify phase=%s hard=%d easy=%d directive=%d hard_signals=%d → %s "
                 "(tokens~%d, tools=%d, kw=%s)",
                 phase.replace("_hard", ""), hard_score, easy_score,
-                directive_score, hard_signals, phase, est_tokens, len(tools),
+                directive_score, hard_signals, phase, est_tokens, tool_count,
                 kw_scores,
             )
         else:

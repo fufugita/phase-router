@@ -44,3 +44,17 @@ Routing decisions are logged to `phase_router.log` alongside the script.
 All model assignments live in the `PHASE_MAP` dict at the top of the file.
 Replace the placeholder values with your actual litellm model names. The
 `FALLBACKS` dict defines per-model fallback chains when a primary fails.
+
+Easy-task ladders fall back to the next-best free model only. Hard-task
+primaries degrade to another paid model first (paid→paid), never silently to
+the free tier.
+
+## Tooling note
+
+Phase detection is driven by the user's prompt, not the tool inventory.
+Orchestration tools (Agent, Workflow, TaskCreate, TaskUpdate) are always
+loaded in agent contexts, so they are deliberately excluded from tool-based
+phase votes — otherwise every request with tools would classify as
+orchestration. A working session (tool inventory present + large context)
+counts as a structural hard signal so substantive continuations escalate
+even when the trailing message is a terse directive or a bare tool result.
