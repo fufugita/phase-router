@@ -2,7 +2,7 @@
 PhaseRouter — litellm pre-call hook that auto-switches models by task phase
 AND difficulty.
 
-Loaded via litellm_settings.callbacks in your proxy config YAML.
+Loaded via litellm_settings.callbacks in <CONFIG_YAML>.
 Classifies each request (keyword + structural, ~0ms, no LLM call) and rewrites
 data["model"] before the router selects a deployment. Existing fallback ladders
 per-model are unaffected.
@@ -12,9 +12,9 @@ Two-layer classification:
   2. Difficulty: how hard? (easy, hard) — only for thinking/planning/coding
 
 Easy tasks → <EASY_MODEL> (free tier)
-Hard tasks → <HARD_MODEL> (paid tier, only when genuinely needed)
+Hard tasks → <HARD_CODING_MODEL> / <HARD_PLANNING_MODEL> (paid, only when genuinely needed)
 
-Logs every routing decision to phase_router.log next to this script.
+Logs every routing decision to ~/.config/litellm/phase_router.log.
 """
 
 import re
@@ -43,15 +43,15 @@ _logger.propagate = False
 # Phase + Difficulty → model mapping
 # ---------------------------------------------------------------------------
 # Cost-aware routing (2026-08-09):
-#   - <EASY_MODEL> is FREE (unlimited on the gateway) — use for all easy tasks + lookup
-#   - <HARD_MODEL> (<HARD_MODEL>) is PAID — use only for hard thinking/coding
-#   - <HARD_PLANNING_MODEL> Sol Ultra (<HARD_PLANNING_MODEL>) is PAID — use only for hard planning
-#   - <ORCHESTRATION_MODEL> (<ORCHESTRATION_MODEL>) is FREE — always for orchestration (agent deployment)
-#   - <LONG_CONTEXT_MODEL> (<LONG_CONTEXT_MODEL>) — long context fallback
+#   - <EASY_MODEL> is FREE (unlimited) — use for all easy tasks + lookup
+#   - <HARD_CODING_MODEL> is PAID — use only for hard thinking/coding
+#   - <HARD_PLANNING_MODEL> is PAID — use only for hard planning
+#   - <ORCHESTRATION_MODEL> is FREE — always for orchestration (agent deployment)
+#   - <LONG_CONTEXT_MODEL> — long context fallback
 #
 # Difficulty escalation is conservative: need ≥2 hard signals AND more hard
 # than easy signals to escalate. False positives waste money; false negatives
-# just mean <EASY_MODEL> handles it (which is fine — <EASY_MODEL> is strong).
+# just mean <EASY_MODEL> handles it (which is fine — it's strong).
 
 PHASE_MAP: Dict[str, str] = {
     # Easy tasks → <EASY_MODEL> (free, unlimited)
@@ -62,9 +62,9 @@ PHASE_MAP: Dict[str, str] = {
     "default":          "<EASY_MODEL>",            # fallback → <EASY_MODEL>
 
     # Hard tasks → paid models (only when difficulty escalates)
-    "thinking_hard":    "<HARD_MODEL>",  # hard thinking → <HARD_MODEL>
+    "thinking_hard":    "<HARD_CODING_MODEL>",  # hard thinking → <HARD_CODING_MODEL>
     "planning_hard":    "<HARD_PLANNING_MODEL>",   # hard planning → <HARD_PLANNING_MODEL>
-    "coding_hard":      "<HARD_MODEL>",  # hard coding → <HARD_MODEL>
+    "coding_hard":      "<HARD_CODING_MODEL>",  # hard coding → <HARD_CODING_MODEL>
 
     # Orchestration → always <ORCHESTRATION_MODEL> (free, agent deployment design center)
     "orchestration":    "<ORCHESTRATION_MODEL>",
@@ -75,27 +75,27 @@ PHASE_MAP: Dict[str, str] = {
 
 # Models temporarily skipped because they're emitting malformed output.
 _SKIP_MODELS = {
-    "<FALLBACK_MODEL_6>",  # emits tool-call syntax as raw content, not JSON tool_calls
+    "<SKIPPED_MODEL>",  # emits tool-call syntax as raw content, not JSON tool_calls
 }
 
 # Fallback chain — when primary fails (timeout, malformed tool call, or
 # downstream HTTP 5xx), litellm's cooldown layer consults this.
 # Format: primary_model -> [fallback1, fallback2, fallback3]
 FALLBACKS: Dict[str, List[str]] = {
-    "<HARD_MODEL>":    ["<EASY_MODEL>",          "<FALLBACK_MODEL>",     "<FALLBACK_MODEL_2>"],
-    "<ORCHESTRATION_MODEL>":         ["<EASY_MODEL>",          "<FALLBACK_MODEL>",     "<FALLBACK_MODEL_2>"],
-    "<EASY_MODEL>":              ["<EASY_MODEL_FALLBACK>",              "<FALLBACK_MODEL>",     "<HARD_MODEL>"],
-    "<EASY_MODEL_FALLBACK>":                  ["<FALLBACK_MODEL>",      "<ORCHESTRATION_MODEL>",   "<HARD_MODEL>"],
-    "<HARD_PLANNING_MODEL>":     ["<HARD_PLANNING_FALLBACK>",       "<EASY_MODEL>",        "<HARD_MODEL>"],
-    "<HARD_PLANNING_FALLBACK>":           ["<HARD_PLANNING_MODEL>", "<EASY_MODEL>",        "<HARD_MODEL>"],
+    "<HARD_CODING_MODEL>":    ["<EASY_MODEL>",          "<FALLBACK_MODEL_D>",     "<FALLBACK_MODEL_B>"],
+    "<ORCHESTRATION_MODEL>":         ["<EASY_MODEL>",          "<FALLBACK_MODEL_D>",     "<FALLBACK_MODEL_B>"],
+    "<EASY_MODEL>":              ["<EASY_MODEL_FALLBACK>",              "<FALLBACK_MODEL_D>",     "<HARD_CODING_MODEL>"],
+    "<EASY_MODEL_FALLBACK>":                  ["<FALLBACK_MODEL_D>",      "<ORCHESTRATION_MODEL>",   "<HARD_CODING_MODEL>"],
+    "<HARD_PLANNING_MODEL>":     ["<HARD_PLANNING_FALLBACK>",       "<EASY_MODEL>",        "<HARD_CODING_MODEL>"],
+    "<HARD_PLANNING_FALLBACK>":           ["<HARD_PLANNING_MODEL>", "<EASY_MODEL>",        "<HARD_CODING_MODEL>"],
 }
 
-# Models that are "default" from Claude Code — safe to rewrite.
+# Models that are "default" from the client — safe to rewrite.
 _REWRITABLE_MODELS = {
     "<EASY_MODEL>",
     "<EASY_MODEL_FALLBACK>",
-    "opus",
-    "claude-opus-5",
+    "<OPUS_ALIAS>",
+    "<OPUS_MODEL>",
 }
 
 # Models known to support Anthropic-format tool calling.
@@ -103,17 +103,17 @@ _TOOL_CAPABLE_MODELS = {
     "<EASY_MODEL>",
     "<EASY_MODEL_FALLBACK>",
     "<ORCHESTRATION_MODEL>",
-    "<FALLBACK_MODEL_3>",
-    "<FALLBACK_MODEL_3>",
-    "<FALLBACK_MODEL_2>",
-    "<FALLBACK_MODEL_2>",
-    "<FALLBACK_MODEL_4>",
-    "<FALLBACK_MODEL_5>",
-    "<FALLBACK_MODEL>",
+    "<FAST_MODEL_A>",
+    "<FAST_MODEL_B>",
+    "<FALLBACK_MODEL_B>",
+    "<FALLBACK_MODEL_C>",
+    "<ALT_MODEL>",
+    "<FALLBACK_MODEL_A>",
+    "<FALLBACK_MODEL_D>",
     "<LONG_CONTEXT_MODEL>",
     "<HARD_PLANNING_MODEL>",
     "<HARD_PLANNING_FALLBACK>",
-    "<HARD_MODEL>",
+    "<HARD_CODING_MODEL>",
 }
 
 # ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ _LOOKUP_KW = re.compile(
 # Difficulty keyword sets
 # ---------------------------------------------------------------------------
 # HARD keywords signal the user wants deep, thorough, or complex work.
-# These trigger escalation from free <EASY_MODEL> to paid harder paid models.
+# These trigger escalation from <EASY_MODEL> to the paid <HARD_*> models.
 # Conservative: need ≥2 hard signals AND more hard than easy to escalate.
 
 _HARD_KW = re.compile(
@@ -219,7 +219,7 @@ _HARD_KW = re.compile(
 )
 
 # EASY keywords signal the user wants a quick, simple answer.
-# These keep the task on free <EASY_MODEL> even if some hard keywords are present.
+# These keep the task on <EASY_MODEL> even if some hard keywords are present.
 _EASY_KW = re.compile(
     r"\b(briefly|quickly|simple|one\s+line|short|concise|tl;?dr|"
     r"just\s+the|only\s+the|skip\s+the|don't\s+explain|"
@@ -258,12 +258,14 @@ _TOOL_PHASE = {
 }
 
 # Estimated token threshold for long-context phase
-_LONG_CTX_THRESHOLD = 150_000
+_LONG_CTX_THRESHOLD = 180_000
 
 # Difficulty thresholds
-_HARD_KW_MIN = 2          # need at least this many hard keyword hits
+_HARD_KW_MIN = 1          # need at least this many hard keyword hits
 _HARD_PROMPT_LEN = 1000   # prompts longer than this (chars) add a hard signal
 _HARD_CTX_TOKENS = 50_000 # context > this many tokens adds a hard signal
+_HARD_SIGNALS_MIN = 2     # require >=2 structural signals to escalate (guards the
+                          # 50k-ctx signal from false-positiving into paid on its own)
 
 
 class PhaseRouter(CustomLogger):
@@ -407,10 +409,21 @@ class PhaseRouter(CustomLogger):
         # Determine the base phase
         phase = "default"
 
-        # 1. If user prompt has a clear keyword winner (≥2 hits), trust it
+        # 1. If user prompt has a clear keyword winner (≥2 hits), trust it.
+        #    Orchestration must WIN outright (score > other phases) to be chosen —
+        #    a single weak orchestration hit is never enough to beat planning/coding.
         if kw_max >= 2:
             if kw_winner == "planning" and kw_max < 3:
                 pass  # planning needs stronger signal
+            elif kw_winner == "orchestration":
+                runner_up = sorted(
+                    kw_scores.values(), reverse=True,
+                )[1] if len(kw_scores) > 1 else 0
+                # Require orchestration to be the strict winner, and the margin
+                # to be meaningful (>=2 clear lead). Otherwise defer to tools
+                # / the next-best phase instead of defaulting to orchestration.
+                if kw_max > runner_up and (kw_max - runner_up) >= 2:
+                    phase = "orchestration"
             else:
                 phase = kw_winner
 
@@ -423,13 +436,28 @@ class PhaseRouter(CustomLogger):
                 elif tool_phases == {"lookup"}:
                     phase = "lookup"
                 elif "orchestration" in tool_phases:
-                    # Only orchestration if user prompt also mentions it
-                    if text and _ORCHESTRATION_KW.search(text):
-                        phase = "orchestration"
+                    # Only orchestration if the USER text (last message) shows
+                    # orchestration intent AND no other phase out-scores it.
+                    user_txt = self._recent_text(messages[-1:], last_n=1)
+                    if user_txt and _ORCHESTRATION_KW.search(user_txt):
+                        if kw_scores["orchestration"] >= kw_scores["coding"] and \
+                           kw_scores["orchestration"] >= kw_scores["planning"]:
+                            phase = "orchestration"
 
-        # 3. If still default, use keyword winner even if weak (≥1 hit)
+        # 3. If still default, use keyword winner even if weak (≥1 hit) —
+        #    but never let a weak orchestration steal from coding/planning/thinking.
         if phase == "default" and kw_max >= 1:
-            phase = kw_winner
+            if kw_winner == "orchestration" and kw_max < 2:
+                # Weak orchestration: fall through to the next-best phase.
+                other = {
+                    k: v for k, v in kw_scores.items() if k != "orchestration"
+                }
+                if other:
+                    next_winner = max(other, key=other.get)
+                    if other[next_winner] >= 1:
+                        phase = next_winner
+            else:
+                phase = kw_winner
 
         # 4. Long context overrides everything
         if est_tokens > _LONG_CTX_THRESHOLD:
@@ -451,11 +479,14 @@ class PhaseRouter(CustomLogger):
                 hard_signals += 1
 
             # Escalate if: enough hard keyword hits AND more hard than easy
-            # Conservative: false positives cost money, false negatives are fine
+            # AND enough structural signals. Escalation notes:
+            #   - hard keywords lowered 2→1 (more triggers)
+            #   - 50k-ctx signal now counts toward hard_signals
+            #   - need >=2 signals so 50k-ctx alone can't false-positive into paid
             is_hard = (
                 hard_score >= _HARD_KW_MIN
                 and hard_score > easy_score
-                and hard_signals >= 1
+                and hard_signals >= _HARD_SIGNALS_MIN
             )
 
             if is_hard:

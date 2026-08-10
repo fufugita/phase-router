@@ -17,11 +17,11 @@ Two-layer classification:
 | Phase | Difficulty | Model |
 |---|---|---|
 | thinking | easy | `<EASY_MODEL>` (free tier) |
-| thinking | hard | `<HARD_MODEL>` (paid tier) |
+| thinking | hard | `<HARD_CODING_MODEL>` (paid tier) |
 | planning | easy | `<EASY_MODEL>` |
 | planning | hard | `<HARD_PLANNING_MODEL>` |
 | coding | easy | `<EASY_MODEL>` |
-| coding | hard | `<HARD_MODEL>` |
+| coding | hard | `<HARD_CODING_MODEL>` |
 | orchestration | — | `<ORCHESTRATION_MODEL>` |
 | lookup | — | `<EASY_MODEL>` |
 
