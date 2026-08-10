@@ -12,9 +12,9 @@ Two-layer classification:
   2. Difficulty: how hard? (easy, hard) — only for thinking/planning/coding
 
 Easy tasks → <EASY_MODEL> (free tier)
-Hard tasks → <HARD_CODING_MODEL> / <HARD_PLANNING_MODEL> (paid, only when genuinely needed)
+Hard tasks → <HARD_CODING_MODEL> / <HARD_PLANNING_MODEL> (paid, but only when genuinely needed)
 
-Logs every routing decision to ~/.config/litellm/phase_router.log.
+Logs every routing decision to <LOG_PATH>.
 """
 
 import re
@@ -31,7 +31,7 @@ from litellm.caching.caching import DualCache
 # Logging
 # ---------------------------------------------------------------------------
 
-_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phase_router.log")
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "<LOG_PATH>")
 _logger = logging.getLogger("phase_router")
 _logger.setLevel(logging.DEBUG)
 _fh = logging.FileHandler(_LOG_PATH)
@@ -49,9 +49,11 @@ _logger.propagate = False
 #   - <ORCHESTRATION_MODEL> is FREE — always for orchestration (agent deployment)
 #   - <LONG_CONTEXT_MODEL> — long context fallback
 #
-# Difficulty escalation is conservative: need ≥2 hard signals AND more hard
-# than easy signals to escalate. False positives waste money; false negatives
-# just mean <EASY_MODEL> handles it (which is fine — it's strong).
+# Difficulty escalation is conservative: need ≥1 hard signal AND user intent
+# (hard keyword, quality-qualifier, or terse directive) AND more hard than easy
+# signals to escalate. A lone context signal only escalates with user intent and
+# not an easy reply. False positives waste money; false negatives just mean
+# <EASY_MODEL> handles it (which is fine — it is strong).
 
 PHASE_MAP: Dict[str, str] = {
     # Easy tasks → <EASY_MODEL> (free, unlimited)
@@ -90,7 +92,7 @@ FALLBACKS: Dict[str, List[str]] = {
     "<HARD_PLANNING_FALLBACK>":           ["<HARD_PLANNING_MODEL>", "<EASY_MODEL>",        "<HARD_CODING_MODEL>"],
 }
 
-# Models that are "default" from the client — safe to rewrite.
+# Models that are "default" from Claude Code — safe to rewrite.
 _REWRITABLE_MODELS = {
     "<EASY_MODEL>",
     "<EASY_MODEL_FALLBACK>",
@@ -107,8 +109,8 @@ _TOOL_CAPABLE_MODELS = {
     "<FAST_MODEL_B>",
     "<FALLBACK_MODEL_B>",
     "<FALLBACK_MODEL_C>",
-    "<ALT_MODEL>",
     "<FALLBACK_MODEL_A>",
+    "<FALLBACK_MODEL_E>",
     "<FALLBACK_MODEL_D>",
     "<LONG_CONTEXT_MODEL>",
     "<HARD_PLANNING_MODEL>",
@@ -181,11 +183,13 @@ _LOOKUP_KW = re.compile(
 # ---------------------------------------------------------------------------
 # HARD keywords signal the user wants deep, thorough, or complex work.
 # These trigger escalation from <EASY_MODEL> to the paid <HARD_*> models.
-# Conservative: need ≥2 hard signals AND more hard than easy to escalate.
+# Conservative: need ≥1 hard signal AND user intent AND more hard than easy.
+# A lone context signal (50k+ tokens) only escalates with a directive/hard
+# keyword — never on "ok"/"yes"/"what is" easy replies.
 
 _HARD_KW = re.compile(
     r"\b(prove|deduc|infer|implications?|trade-?offs?|consequences?|"
-    r"edge\s*cases?|comprehensive|thorough|exhaustive|in\s+depth|"
+    r"edge\s*cases?|comprehensive|thorough|exhaustive|rigorous|in\s+depth|"
     r"deep\s*dive|root\s*cause|investigat|trace|diagnos|"
     r"architect|design\s+pattern|system\s+design|"
     r"optimi[sz]|refactor|restructur|rearchitect|"
@@ -194,7 +198,8 @@ _HARD_KW = re.compile(
     r"memory\s+leak|profil|bottleneck|latency|throughput|"
     r"multi-?step|multi-?stage|complex|intricate|nuanc|"
     r"subtle|advanced|expert|senior|staff\s+level|"
-    r"production\s+ready|enterprise|mission\s+critical|"
+    r"production\s+ready|enterprise|mission\s+critical|critical|"
+    r"no\s+gaps?|no\s+shortcuts?|production-?grade|battle-?tested|"
     r"regression|compatibility|breaking\s+change|"
     r"analy[sz]e|evaluat|assess|critiqu|"
     r"compar|contrast|weigh|reason\s+about|"
@@ -214,7 +219,46 @@ _HARD_KW = re.compile(
     r"migration\s+strategy|rollout|deployment\s+plan|"
     r"decompos|monolith|microservice|"
     r"scalability|high\s+availability|disaster\s+recovery|"
-    r"engineer|reverse\s+engineer|production)\b",
+    r"engineer|reverse\s+engineer|production|"
+    # Quality-qualifier hard signal — the user's terse style appends these
+    # ("do it properly", "make sure it's right", "no half-assed").
+    r"properly|correctly|done\s+right|the\s+right\s+way|as\s+it\s+should|"
+    r"actually\s+work(?:s|ing)?|carefully|rigorously|no\s+half-?assed|"
+    r"for\s+real(?:,\s*this\s+time)?|this\s+time\s+for\s+real|"
+    r"do\s+it\s+right|make\s+it\s+work|make\s+it\s+right|get\s+it\s+right|"
+    # Correction/friction hard signal — user is dissatisfied, wants it done
+    # precisely this time ("still not", "not yet", "exactly").
+    r"still\s+not|not\s+yet|precisely|exactly|"
+    r"not\s+(?:triggering|working|getting|right|good|done|enough)|"
+    r"doesn['’]?t\s+work|didn['’]?t\s+work|broke|broken|wrong|"
+    r"incomplete|missing|overlooked|you\s+(?:missed|forgot)|"
+    r"try\s+again|redo|more\s+broad|broader|more\s+precise)\b",
+    re.IGNORECASE,
+)
+
+# DIRECTIVE keywords — the user's terse imperative style ("do it", "fix this",
+# "get it working"). A directive on top of a large context is a strong hard
+# signal even when the literal text has zero analytical vocabulary.
+_DIRECTIVE_KW = re.compile(
+    r"\b(do\s+it|do\s+this|do\s+that|do\s+the\s+thing|"
+    r"make\s+it|make\s+this|make\s+it\s+work|make\s+it\s+right|"
+    r"make\s+sure|ensure\s+(?:it|this|that)|"
+    r"fix\s+it|fix\s+this|get\s+it\s+working|get\s+this\s+working|"
+    r"work\s+it\s+out|sort\s+it|sort\s+this|handle\s+it|handle\s+this|"
+    r"deal\s+with\s+it|take\s+care\s+of\s+it|"
+    r"build\s+it|write\s+it|implement\s+it|finish\s+it|finish\s+this|"
+    r"ship\s+it|push\s+this|wrap\s+this\s+up|"
+    r"need\s+it\s+done|want\s+it\s+done|get\s+this\s+done|"
+    r"make\s+it\s+happen|now\s+do|go\s+do|"
+    r"we\s+need\s+to|we\s+should|let['’]s\s+get|time\s+to\s+get|"
+    # Correction/friction phrasing from the user's actual transcripts:
+    # "still not", "not good yet", "try again", "resume".
+    r"still\s+(?:not|doesn['’]?t|isn['’]?t|won['’]?t)|"
+    r"not\s+(?:working|triggering|getting|good|right|done|enough)|"
+    r"doesn['’]?t\s+work|didn['’]?t\s+work|broke|broken|wrong|"
+    r"incomplete|missing|overlooked|you\s+(?:missed|forgot)|"
+    r"try\s+again|redo|resume|continue\s+(?:this|where|from)|"
+    r"more\s+broad|broader|more\s+precise|precisely)\b",
     re.IGNORECASE,
 )
 
@@ -261,11 +305,16 @@ _TOOL_PHASE = {
 _LONG_CTX_THRESHOLD = 180_000
 
 # Difficulty thresholds
-_HARD_KW_MIN = 1          # need at least this many hard keyword hits
+_HARD_KW_MIN = 1          # need at least this many hard keyword hits (amplified: was 2)
 _HARD_PROMPT_LEN = 1000   # prompts longer than this (chars) add a hard signal
 _HARD_CTX_TOKENS = 50_000 # context > this many tokens adds a hard signal
-_HARD_SIGNALS_MIN = 2     # require >=2 structural signals to escalate (guards the
-                          # 50k-ctx signal from false-positiving into paid on its own)
+_HARD_SIGNALS_MIN = 1     # ANY single hard signal can escalate (was 2 — the
+                          # 50k-ctx signal alone was the dominant blocker: 236/300
+                          # classifications sat at exactly 1 signal and stayed on <EASY_MODEL>).
+                          # False-positive guard moved into the classifier: a lone
+                          # context signal only escalates when the user's own
+                          # message shows intent (directive/hard keyword) and is
+                          # NOT an easy "ok/yes/what is" reply.
 
 
 class PhaseRouter(CustomLogger):
@@ -421,7 +470,7 @@ class PhaseRouter(CustomLogger):
                 )[1] if len(kw_scores) > 1 else 0
                 # Require orchestration to be the strict winner, and the margin
                 # to be meaningful (>=2 clear lead). Otherwise defer to tools
-                # / the next-best phase instead of defaulting to orchestration.
+                # / the next-best phase instead of defaulting to <ORCHESTRATION_MODEL>.
                 if kw_max > runner_up and (kw_max - runner_up) >= 2:
                     phase = "orchestration"
             else:
@@ -465,38 +514,83 @@ class PhaseRouter(CustomLogger):
 
         # --- Difficulty assessment (only for escalatable phases) ---
 
+        # Difficulty runs on escalatable phases AND on "default". A terse
+        # directive ("still not getting triggered precisely", "do it properly")
+        # has zero phase keywords → lands on "default" — and a default with a
+        # directive/hard intent must still be able to escalate. So normalize
+        # default-with-intent to "coding" (directive work is coding work).
+        hard_probe = len(_HARD_KW.findall(text)) if text else 0
+        directive_probe = len(_DIRECTIVE_KW.findall(text)) if text else 0
+        if phase == "default" and (hard_probe >= 1 or directive_probe >= 1):
+            phase = "coding"
+
+        # Directive overrides thinking: a terse imperative ("we need to be more
+        # broad", "fix it") is coding intent even if it happens to contain a
+        # thinking word ("analyze the way i type"). Escalation is what matters;
+        # the label should read as the work being done.
+        if phase == "thinking" and directive_probe >= 1:
+            phase = "coding"
+
         if phase in ("thinking", "planning", "coding"):
             hard_score = len(_HARD_KW.findall(text)) if text else 0
             easy_score = len(_EASY_KW.findall(text)) if text else 0
+            directive_score = len(_DIRECTIVE_KW.findall(text)) if text else 0
 
-            # Structural hard signals
+            # Structural hard signals — a directive counts as a hard signal so a
+            # terse imperative ("fix this", "not good yet") escalates even on a
+            # small context with zero analytical vocabulary.
             hard_signals = 0
             if hard_score >= _HARD_KW_MIN:
+                hard_signals += 1
+            if directive_score >= 1:
                 hard_signals += 1
             if len(text) > _HARD_PROMPT_LEN:
                 hard_signals += 1
             if est_tokens > _HARD_CTX_TOKENS:
                 hard_signals += 1
 
+            # User-message intent (the part that's under the operator's control):
+            # a hard keyword, a quality-qualifier, or a terse directive.
+            user_intent = (hard_score >= 1) or (directive_score >= 1)
+
+            # Easy-message guard — a lone context signal must NOT escalate when
+            # the user's own message is an easy reply ("ok", "yes", "what is X").
+            ctx_only = (hard_signals == 1 and est_tokens > _HARD_CTX_TOKENS
+                        and hard_score == 0 and directive_score == 0
+                        and len(text) <= _HARD_PROMPT_LEN)
+            easy_reply = (easy_score >= 1 and not user_intent)
+
             # Escalate if: enough hard keyword hits AND more hard than easy
-            # AND enough structural signals. Escalation notes:
+            # AND enough structural signals. Amplified (2026-08-10):
             #   - hard keywords lowered 2→1 (more triggers)
             #   - 50k-ctx signal now counts toward hard_signals
             #   - need >=2 signals so 50k-ctx alone can't false-positive into paid
+            # Broadened (2026-08-10, this edit):
+            #   - guard lowered 2→1: ANY single signal can escalate
+            #   - NEW directive signal: terse imperatives ("do it", "fix this",
+            #     "get it working") now count as user intent
+            #   - context-only escalation needs user intent and NOT an easy reply
+            #     ("ok"/"yes"/"what is") — big context alone no longer escalates
             is_hard = (
-                hard_score >= _HARD_KW_MIN
-                and hard_score > easy_score
-                and hard_signals >= _HARD_SIGNALS_MIN
+                hard_signals >= _HARD_SIGNALS_MIN
+                and user_intent
+                and (hard_score > easy_score or directive_score >= 1)
             )
+
+            # Lone-context special case: big session + a directive/terse task but
+            # zero analytical keywords ("we need to be more broad" on 100k tokens).
+            if not is_hard and ctx_only and user_intent and not easy_reply:
+                is_hard = True
 
             if is_hard:
                 phase = phase + "_hard"
 
             _logger.debug(
-                "classify phase=%s hard=%d easy=%d hard_signals=%d → %s "
+                "classify phase=%s hard=%d easy=%d directive=%d hard_signals=%d → %s "
                 "(tokens~%d, tools=%d, kw=%s)",
                 phase.replace("_hard", ""), hard_score, easy_score,
-                hard_signals, phase, est_tokens, len(tools), kw_scores,
+                directive_score, hard_signals, phase, est_tokens, len(tools),
+                kw_scores,
             )
         else:
             _logger.debug(
