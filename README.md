@@ -37,7 +37,7 @@ litellm_settings:
 
 3. Restart the litellm proxy.
 
-Routing decisions are logged to `phase_router.log` alongside the script.
+Routing decisions are logged to `<LOG_PATH>` alongside the script.
 
 ## Configuration
 
